@@ -1,0 +1,54 @@
+import argparse
+from pathlib import Path
+import torch
+from torch.optim import AdamW
+from src import helper_functions
+from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--train_root", default="dataset/DOTAv1.0/train")
+    parser.add_argument("--val_root", default="dataset/DOTAv1.0/val")
+    parser.add_argument("--work_dir", default="runs/sddfb")
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--img_size", type=int, default=256)
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--weight_decay", type=float, default=1e-4)
+    # parser.add_argument("--cls-weight", type=float, default=1.0)
+    # parser.add_argument("--bbox-weight", type=float, default=1.0)
+    # parser.add_argument("--angle-weight", type=float, default=0.5)
+    # parser.add_argument("--centerness-weight", type=float, default=0.25)
+    # parser.add_argument("--seg-weight", type=float, default=0.25)
+    # parser.add_argument("--grad-clip", type=float, default=5.0)
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    work_dir = Path(args.work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    train_loader, val_loader = helper_functions.create_dataloaders(train_root=args.train_root, val_root=args.val_root, image_size=args.img_size,
+                                                  batch_size=args.batch_size)
+
+    model = helper_functions.build_model().to(device)
+    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    print("device:", device)
+    print("train samples:", len(train_loader.dataset))
+    print("val samples:", len(val_loader.dataset))
+    print("work dir:", work_dir)
+
+    num_epochs = args.epochs
+
+    warmup_epochs = 5
+    warmup = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_epochs)
+    cosine = CosineAnnealingLR( optimizer, T_max=max(1, num_epochs - warmup_epochs), eta_min=args.lr * 0.05)
+    scheduler = SequentialLR( optimizer, schedulers=[warmup, cosine], milestones=[warmup_epochs])
+    history = helper_functions.train(model, train_loader, val_loader, optimizer, scheduler, work_dir, num_epochs)
+    helper_functions.plot_history(history)
+
+if __name__ == "__main__":
+    main()
