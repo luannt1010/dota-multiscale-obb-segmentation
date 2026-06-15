@@ -9,6 +9,7 @@ import numpy as np
 import math
 from PIL import Image, ImageDraw
 import random
+from src import config
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from src.dota_dataset import DotaDataset
@@ -18,19 +19,7 @@ from src.head import DualTaskHead
 from src.model import SDDFBModel
 from src.neck import SDDFBNeck
 
-DOTA_CLASSES = ["plane", "baseball-diamond", "bridge", "ground-track-field", "small-vehicle", "large-vehicle", "ship", "tennis-court",
-                "basketball-court", "storage-tank", "soccer-ball-field", "roundabout", "harbor", "swimming-pool", "helicopter"]
-OUTPUT_STRIDE = 4
 
-CLASS_COLORS = [
-    (230, 25, 75), (60, 180, 75), (255, 225, 25), (0, 130, 200), (245, 130, 48),
-    (145, 30, 180), (70, 240, 240), (240, 50, 230), (210, 245, 60), (250, 190, 190),
-    (0, 128, 128), (230, 190, 255), (170, 110, 40), (255, 250, 200), (128, 0, 0),
-]
-CLASS_TO_ID = {name: idx for idx, name in enumerate(DOTA_CLASSES)}
-GREEN = (0, 255, 0)
-RED = (255, 0, 0)
-GT_YELLOW = (255, 255, 0)
 
 def parse_dota_label(label_path, class_to_id):
     objects = []
@@ -255,8 +244,8 @@ def collate_fn(batch):
     return torch.stack(images), merged_targets, list(metas)
 
 def create_dataloaders(train_root="dataset/DOTAv1.0/train", val_root="dataset/DOTAv1.0/val", image_size=512, batch_size=2):
-    train_dataset = DotaDataset(train_root, image_size=image_size, stride=OUTPUT_STRIDE, augment=True)
-    val_dataset = DotaDataset(val_root, image_size=image_size, stride=OUTPUT_STRIDE, augment=False)
+    train_dataset = DotaDataset(train_root, image_size=image_size, stride=config.OUTPUT_STRIDE, augment=True)
+    val_dataset = DotaDataset(val_root, image_size=image_size, stride=config.OUTPUT_STRIDE, augment=False)
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2, collate_fn=collate_fn, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2, collate_fn=collate_fn, pin_memory=True)
@@ -428,7 +417,7 @@ def suppress_duplicate_centers(detections, min_distance=12):
     return kept
 
 
-def decode_predictions(outputs, image_size, stride=4, conf_threshold=0.15, topk=50, class_names=DOTA_CLASSES):
+def decode_predictions(outputs, image_size, stride=4, conf_threshold=0.15, topk=50, class_names=config.DOTA_CLASSES):
     obb = outputs["obb"] if "obb" in outputs else outputs
     cls_scores = obb["cls_logits"].sigmoid()[0]
     centerness = obb["centerness"][0].clamp(0, 1)
@@ -480,10 +469,10 @@ def draw_obb_image(image, detections, gt_objects=None):
     obb_image = image.copy()
     draw = ImageDraw.Draw(obb_image)
     for obj in gt_objects or []:
-        draw.polygon([tuple(point) for point in obj["polygon"]], outline=GT_YELLOW, width=1)
+        draw.polygon([tuple(point) for point in obj["polygon"]], outline=config.GT_YELLOW, width=1)
 
     for det in detections:
-        color = GREEN if det.get("correct", False) else RED
+        color = config.GREEN if det.get("correct", False) else config.RED
         polygon = obb_to_polygon(*det["obb"])
         draw.polygon(polygon, outline=color, width=2)
         label = f"{det['class_name']} {det['score']:.2f}"
@@ -511,22 +500,22 @@ def draw_segment_image(image, outputs, image_size, gt_objects=None, threshold=0.
         correct = valid & (gt_class_map == class_map)
         false_positive_or_wrong_class = valid & ~correct
         missed_gt = (~valid) & (gt_class_map >= 0)
-        overlay[correct] = (1.0 - alpha) * overlay[correct] + alpha * np.asarray(GREEN, dtype=np.float32)
+        overlay[correct] = (1.0 - alpha) * overlay[correct] + alpha * np.asarray(config.GREEN, dtype=np.float32)
         overlay[false_positive_or_wrong_class] = (
-            (1.0 - alpha) * overlay[false_positive_or_wrong_class] + alpha * np.asarray(RED, dtype=np.float32)
+            (1.0 - alpha) * overlay[false_positive_or_wrong_class] + alpha * np.asarray(config.RED, dtype=np.float32)
         )
-        overlay[missed_gt] = (1.0 - alpha) * overlay[missed_gt] + alpha * np.asarray(RED, dtype=np.float32)
+        overlay[missed_gt] = (1.0 - alpha) * overlay[missed_gt] + alpha * np.asarray(config.RED, dtype=np.float32)
     else:
         for cls_id in np.unique(class_map[valid]):
             mask = valid & (class_map == cls_id)
-            color = np.asarray(CLASS_COLORS[int(cls_id) % len(CLASS_COLORS)], dtype=np.float32)
+            color = np.asarray(config.CLASS_COLORS[int(cls_id) % len(config.CLASS_COLORS)], dtype=np.float32)
             overlay[mask] = (1.0 - alpha) * overlay[mask] + alpha * color
 
     segment_image = Image.fromarray(np.clip(overlay, 0, 255).astype(np.uint8))
     if gt_objects:
         draw = ImageDraw.Draw(segment_image)
         for obj in gt_objects:
-            draw.polygon([tuple(point) for point in obj["polygon"]], outline=GT_YELLOW, width=1)
+            draw.polygon([tuple(point) for point in obj["polygon"]], outline=config.GT_YELLOW, width=1)
     return segment_image
 
 
@@ -542,7 +531,7 @@ def inference(model,image_path, label_path=None, image_size=256, conf_threshold=
         label_path = infer_label_path(image_path)
     gt_objects = []
     if label_path is not None and Path(label_path).exists():
-        raw_objects = parse_dota_label(label_path, CLASS_TO_ID)
+        raw_objects = parse_dota_label(label_path, config.CLASS_TO_ID)
         _, gt_objects = resize_image_and_objects(original_image, raw_objects, image_size)
 
     image_array = np.asarray(image, dtype=np.float32).transpose(2, 0, 1) / 255.0
@@ -551,7 +540,7 @@ def inference(model,image_path, label_path=None, image_size=256, conf_threshold=
     with torch.no_grad():
         outputs = model(image_tensor)
 
-    detections = decode_predictions(outputs, image_size, stride=OUTPUT_STRIDE, conf_threshold=conf_threshold, topk=topk)
+    detections = decode_predictions(outputs, image_size, stride=config.OUTPUT_STRIDE, conf_threshold=conf_threshold, topk=topk)
     detections = evaluate_detections(detections, gt_objects, image_size, iou_threshold=obb_iou_threshold)
     obb_image = draw_obb_image(image, detections, gt_objects=gt_objects)
     segment_image = draw_segment_image(image, outputs, image_size, gt_objects=gt_objects, threshold=seg_threshold)
