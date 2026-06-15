@@ -8,7 +8,7 @@ The model detects objects in remote sensing images using **Oriented Bounding Box
 
 You can get this architecture file .PNG at workflow/architecture.png
 
-<image_src="workflow/architecture.png" alt="Architecture" width="200"/>
+<image src="workflow/architecture.png" alt="Architecture" width="200"/>
 
 ## Project Structure
 
