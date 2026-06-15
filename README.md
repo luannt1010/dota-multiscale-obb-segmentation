@@ -4,6 +4,12 @@ This project is an end-to-end prototype for **aerial object detection and segmen
 
 The model detects objects in remote sensing images using **Oriented Bounding Boxes (OBB)** and also predicts segmentation masks. It is designed for objects with different scales and rotations, such as planes, ships, vehicles, bridges, and harbors.
 
+## Architecture
+
+You can get this architecture file .PNG at workflow/architecture.png
+
+<image_src="workflow/architecture.png" alt="Architecture" width="200"/>
+
 ## Project Structure
 
 ```bash
