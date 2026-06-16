@@ -4,10 +4,8 @@ import numpy as np
 import torch
 from PIL import Image
 from torch.utils.data import Dataset
+from src.config import DOTA_CLASSES
 
-
-DOTA_CLASSES = ["plane", "baseball-diamond", "bridge", "ground-track-field", "small-vehicle", "large-vehicle", "ship", "tennis-court",
-                "basketball-court", "storage-tank", "soccer-ball-field", "roundabout", "harbor", "swimming-pool", "helicopter"]
 
 class DotaDataset(Dataset):
     def __init__(self, root_dir, image_size=512, stride=4, augment=False, keep_difficult=False):
