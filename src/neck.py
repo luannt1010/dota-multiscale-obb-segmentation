@@ -1,7 +1,7 @@
 import torch.nn as nn
 import torch.nn.functional as F
-from src.flow import FineFlow, ContextFlow
-from src.gate import CrossAttention, ScaleGate
+from src import FineFlow, ContextFlow
+from src import CrossAttention, ScaleGate
 
 
 class SDDFBNeck(nn.Module):
