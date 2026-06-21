@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from src.backbone import LSKBlock
+from src import LSKBlock
 
 class FineFlow(nn.Module):
     def __init__(self, c2, c3, out_channels=256):
