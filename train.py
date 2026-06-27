@@ -7,8 +7,8 @@ from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--train_root", default="dataset/DOTAv1.0/train")
-    parser.add_argument("--val_root", default="dataset/DOTAv1.0/val")
+    parser.add_argument("--train_root", default=r"./dataset/DOTAv1.0/train")
+    parser.add_argument("--val_root", default=r"./dataset/DOTAv1.0/val")
     parser.add_argument("--work_dir", default="runs/sddfb")
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--img_size", type=int, default=256)
