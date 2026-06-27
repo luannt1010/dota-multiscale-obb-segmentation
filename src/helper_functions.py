@@ -18,6 +18,7 @@ from src.backbone import LSKNetBackbone
 from src.head import DualTaskHead
 from src.model import SDDFBModel
 from src.neck import SDDFBNeck
+from src.fpn_network import SimpleFPN
 
 
 
@@ -332,9 +333,10 @@ def train(model, train_loader, val_loader, optimizer, scheduler, sp, num_epochs)
 
 def build_model(num_classes=15):
     backbone = LSKNetBackbone(embed_dims=(32, 64, 160, 256))
-    neck = SDDFBNeck(32, 64, 160, 256, out_channels=256, num_heads=8)
+    fpn = SimpleFPN()
+    neck = SDDFBNeck(256, 256, 256, 256, out_channels=256, num_heads=8)
     head = DualTaskHead(in_channels=256, num_classes=num_classes)
-    return SDDFBModel(backbone, neck, head)
+    return SDDFBModel(backbone, fpn, neck, head)
 
 
 def obb_to_polygon(cx, cy, width, height, angle):
