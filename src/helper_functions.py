@@ -186,6 +186,7 @@ def make_segmentation_target(objects, image_size, stride, num_classes):
 
 
 def make_targets(objects, image_size=512, stride=4, num_classes=15, gaussian_radius=2):
+    # Tạo target theo cell trên feature map
     out_h = image_size // stride
     out_w = image_size // stride
     heatmap = torch.zeros(num_classes, out_h, out_w, dtype=torch.float32)
