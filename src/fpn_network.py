@@ -22,15 +22,10 @@ class SimpleFPN(nn.Module):
 
         self.smooth = nn.Conv2d(d, d, kernel_size=3, padding=1, stride=1)
     def forward(self, c2, c3, c4, c5):
-        c2 = self.conv_c2(c2)
-        c3 = self.conv_c3(c3)
-        c4 = self.conv_c4(c4)
-        c5 = self.conv_c5(c5)
-
-        p5 = c5
-        p4 = self.up_sampler(p5) + c4
-        p3 = self.up_sampler(p4) + c3
-        p2 = self.up_sampler(p3) + c2
+        p5 = self.conv_c5(c5)
+        p4 = self.up_sampler(p5) + self.conv_c4(c4)
+        p3 = self.up_sampler(p4) + self.conv_c3(c3)
+        p2 = self.up_sampler(p3) + self.conv_c2(c2)
 
         return self.smooth(p2), self.smooth(p3), self.smooth(p4), self.smooth(p5)
 
