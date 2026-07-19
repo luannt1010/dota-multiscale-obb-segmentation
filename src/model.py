@@ -13,9 +13,6 @@ class SDDFBModel(nn.Module):
         c2, c3, c4, c5 = self.backbone(images)
         p2, p3, p4, p5 = self.fpn(c2, c3, c4, c5)
         neck_out = self.neck(p2, p3, p4, p5)
-        try:
-            outputs = self.head(neck_out)
-        except TypeError:
-            outputs = self.head(neck_out["fused"])
+        outputs = self.head(neck_out)
 
         return outputs
