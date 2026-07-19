@@ -1,14 +1,12 @@
 import os
-from src import helper_functions
 import numpy as np
 import torch
 from PIL import Image
 from torch.utils.data import Dataset
 from src.config import DOTA_CLASSES
 
-
 class DotaDataset(Dataset):
-    def __init__(self, root_dir, image_size=512, stride=4, augment=False, keep_difficult=False):
+    def __init__(self, root_dir, image_size=1024, stride=4, augment=False, keep_difficult=False):
         self.root = root_dir
         self.image_size = image_size
         self.stride = stride
@@ -30,7 +28,7 @@ class DotaDataset(Dataset):
         results = {}
         images_path = os.path.join(self.root, "images")
         for img_name in os.listdir(images_path):
-            if img_name.endswith((".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")):
+            if img_name.lower().endswith((".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")):
                 stem = os.path.splitext(img_name)[0]
                 img_path = os.path.join(images_path, img_name)
                 results[stem] = img_path
@@ -47,8 +45,9 @@ class DotaDataset(Dataset):
         return results
 
     def __getitem__(self, idx):
+        from src import helper_functions
         stem, image_path, label_path = self.items[idx]
-        image = Image.open(image_path)
+        image = Image.open(image_path).convert("RGB")
         objects = helper_functions.parse_dota_label(label_path, self.class2id)
         if self.keep_difficult:
             for obj in objects:
@@ -57,7 +56,7 @@ class DotaDataset(Dataset):
         if self.augment:
             image, objects = helper_functions.apply_train_augmentation(image, objects)
 
-        image_array = np.asarray(image, dtype=np.float32).transpose(2, 0, 1) / 255.0
+        image_array = np.array(image, dtype=np.float32, copy=True).transpose(2, 0, 1) / 255.0
         image_tensor = torch.from_numpy(image_array)
         targets = helper_functions.make_targets(objects, self.image_size, self.stride, self.num_classes)
 
