@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from src import LSKBlock
+from src.backbone import norm2d
 
 class FineFlow(nn.Module):
     def __init__(self, c2, c3, out_channels=256):
@@ -12,7 +13,7 @@ class FineFlow(nn.Module):
         self.d1 = nn.Conv2d(out_channels, out_channels, 3, padding=1, dilation=1)
         self.d2 = nn.Conv2d(out_channels, out_channels, 3, padding=2, dilation=2)
         self.d4 = nn.Conv2d(out_channels, out_channels, 3, padding=4, dilation=4)
-        self.bn = nn.BatchNorm2d(out_channels)
+        self.bn = norm2d(out_channels)
         self.fuse = nn.Conv2d(out_channels * 3, out_channels, 1)
         self.act = nn.GELU()
 
