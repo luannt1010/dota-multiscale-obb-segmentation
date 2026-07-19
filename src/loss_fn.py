@@ -46,7 +46,13 @@ def detection_loss(outputs, targets, cls_w=1, bbox_w=1, angle_w=0.5, centerness_
     cls_loss = heatmap_focal_loss(cls_logits, heatmap)
     bbox_loss = masked_l1(pred_bbox, bbox, mask)
     target_angle = angle * torch.pi
-    angle_diff = torch.atan2(torch.sin(pred_angle - target_angle), torch.cos(pred_angle - target_angle)) / torch.pi
+    # A rectangle is unchanged by a 180-degree rotation. Wrapping 2 * delta
+    # makes theta and theta + pi equivalent, which is essential after flips.
+    angle_delta = pred_angle - target_angle
+    angle_diff = 0.5 * torch.atan2(
+        torch.sin(2.0 * angle_delta), torch.cos(2.0 * angle_delta)
+    )
+    angle_diff = angle_diff / (torch.pi / 2.0)
     angle_loss = masked_l1(angle_diff, torch.zeros_like(angle_diff), mask)
     centerness_loss = binary_focal_loss(pred_centerness, centerness)
 
@@ -62,8 +68,10 @@ def segmentation_loss(outputs, targets, seg_w=0.25):
     target = targets["segmentation"].to(logits.device)
     pos = target.eq(1.0).float()
     neg = target.lt(1.0).float()
-    pos_count = pos.sum().clamp(min=1.0)
-    neg_count = neg.sum().clamp(min=1.0)
+    # Weight positive pixels per class so frequent categories do not dominate.
+    count_dims = (0, 2, 3)
+    pos_count = pos.sum(dim=count_dims, keepdim=True).clamp(min=1.0)
+    neg_count = neg.sum(dim=count_dims, keepdim=True).clamp(min=1.0)
     pos_weight = (neg_count / pos_count).clamp(max=20.0)
 
     bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
