@@ -1,4 +1,3 @@
-import torch
 import torch.nn as nn
 
 class Upsampler(nn.Module):
@@ -20,14 +19,15 @@ class SimpleFPN(nn.Module):
         self.conv_c4 = UpChannel(160, d)
         self.conv_c5 = UpChannel(256, d)
 
-        self.smooth = nn.Conv2d(d, d, kernel_size=3, padding=1, stride=1)
+        self.smooth = nn.ModuleList([nn.Conv2d(d, d, kernel_size=3, padding=1, stride=1) for _ in range(4)])
     def forward(self, c2, c3, c4, c5):
         p5 = self.conv_c5(c5)
         p4 = self.up_sampler(p5) + self.conv_c4(c4)
         p3 = self.up_sampler(p4) + self.conv_c3(c3)
         p2 = self.up_sampler(p3) + self.conv_c2(c2)
 
-        return self.smooth(p2), self.smooth(p3), self.smooth(p4), self.smooth(p5)
+        features = (p2, p3, p4, p5)
+        return tuple(layer(feature) for layer, feature in zip(self.smooth, features))
 
 class UpChannel(nn.Module):
     def __init__(self, in_channels, out_channels=256):
