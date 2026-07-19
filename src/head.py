@@ -2,6 +2,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from src.backbone import norm2d
 
 
 class OBBDetectionHead(nn.Module):
@@ -12,11 +13,11 @@ class OBBDetectionHead(nn.Module):
         reg_layers = []
         for _ in range(4):
             cls_layers.extend([nn.Conv2d(feat_channels, feat_channels, 3, padding=1),
-                               nn.BatchNorm2d(feat_channels),
+                               norm2d(feat_channels),
                                nn.GELU(),
                                nn.Dropout2d(p=dropout)])
             reg_layers.extend([nn.Conv2d(feat_channels, feat_channels,3, padding=1),
-                               nn.BatchNorm2d(feat_channels),
+                               norm2d(feat_channels),
                                nn.GELU(),
                                nn.Dropout2d(p=dropout)])
         self.stem = nn.Conv2d(in_channels, feat_channels,1)
@@ -44,15 +45,15 @@ class SegmentationHead(nn.Module):
         super().__init__()
 
         self.decoder = nn.Sequential(nn.Conv2d(in_channels, hidden_channels,3, padding=1),
-                                     nn.BatchNorm2d(hidden_channels),
+                                     norm2d(hidden_channels),
                                      nn.GELU(),
                                      nn.Dropout2d(p=dropout),
                                      nn.Conv2d(hidden_channels, hidden_channels,3, padding=1),
-                                     nn.BatchNorm2d(hidden_channels),
+                                     norm2d(hidden_channels),
                                      nn.GELU(),
                                      nn.Dropout2d(p=dropout),
                                      nn.Conv2d(hidden_channels, hidden_channels,3, padding=1),
-                                     nn.BatchNorm2d(hidden_channels),
+                                     norm2d(hidden_channels),
                                      nn.GELU(),
                                      nn.Dropout2d(p=dropout))
 
