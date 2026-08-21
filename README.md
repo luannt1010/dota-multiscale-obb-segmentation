@@ -101,8 +101,10 @@ python train.py
 
 Or run training with custom arguments:
 
-Source images may have different sizes. The loader resizes each image and its
-polygon coordinates to the selected square `--img_size` (default: `1024`).
+Each image is resized with aspect-ratio-preserving letterbox padding to the square
+`--img_size` input expected by the model. The current pipeline does not split images
+into tiles. Any positive `--img_size` is accepted and rounded upward to the nearest
+multiple of 32 (for example, `1000 -> 1024`); 1024 is the default.
 
 ```bash
 python train.py ^
@@ -138,7 +140,7 @@ python train.py \
 | `--val_root`     |   `dataset/DOTAv1.0/val` | Path to the validation dataset               |
 | `--work_dir`     |             `runs/sddfb` | Directory for saving outputs and checkpoints |
 | `--epochs`       |                     `10` | Number of training epochs                    |
-| `--img_size`     |                   `1024` | Resize image and polygons to this square size |
+| `--img_size`     |                   `1024` | Letterboxed size; rounded up to a multiple of 32 |
 | `--batch_size`   |                      `1` | Training batch size                          |
 | `--lr`           |                   `1e-4` | Learning rate                                |
 | `--weight_decay` |                   `1e-4` | Weight decay for optimizer                   |
@@ -162,8 +164,28 @@ training_history.png
 
 Validation is computed over the complete validation set on every epoch:
 
-- OBB detection: exact convex-polygon IoU, class-wise rotated NMS, `mAP@50` and COCO-style `mAP@50:95`.
-- Segmentation: per-class and mean IoU, Dice, precision, recall and pixel accuracy.
-- Objects marked `difficult != 0` are ignored rather than counted as positives or false positives.
+- OBB predictions are decoded on each letterboxed validation image, filtered by class-wise rotated NMS, and scored with exact-polygon `mAP@50` and COCO-style `mAP@50:95`.
+- Segmentation reports per-class and mean IoU, Dice, precision, recall and pixel accuracy on the model output grid.
+- DOTA annotations marked `difficult != 0` are ignored in detection/segmentation loss and metrics, so predictions in those regions are not trained or counted as false positives.
+
+When object centres collide on the stride-4 grid, each object is assigned the nearest free regression cell; signed box distances still decode its original OBB exactly. Training uses full float32 precision on both CPU and CUDA.
 
 The DOTA annotations are oriented polygons, not object silhouette masks. The segmentation task therefore learns filled polygon masks and its scores should not be presented as true silhouette-segmentation quality.
+
+## Image and Video Application
+
+The PyQt6 desktop application has separate Image and Video tabs. It loads one checkpoint into memory at startup and shares the cached model between both tabs. No tiling is used: images are processed by the existing `src.helper_functions.inference` function, while video frames use the same letterbox, forward, decode, segmentation and OBB rendering pipeline in memory.
+
+The Video tab has a tracker selector so the same input can be run with two algorithms:
+
+- `Rotated IoU` uses class-aware rotated IoU, constant-velocity prediction, two confidence stages and global Hungarian assignment. It is the faster geometry-only baseline.
+- `DeepSORT` uses a 10-dimensional Kalman state for the rotated box, Mahalanobis motion gating, a recency matching cascade and cosine appearance distance. Appearance embeddings are pooled from rotated ROIs on the model's 256-channel fused neck feature map, so no separate package or downloaded ReID checkpoint is required.
+
+Output filenames contain the selected tracker name for side-by-side comparison. OBB and Combined labels include a stable `ID`; identities survive short missed detections and reset for every new video run. Segmentation is a semantic class mask, so it remains a per-frame model prediction rather than an instance-tracked mask.
+
+```bash
+pip install -r requirements.txt
+python app.py
+```
+
+If `--checkpoint` is omitted, the app checks `DOTA_MODEL_PATH`, then `res/best.pth`, `best_map.pth`, `last.pth`, followed by the same checkpoint names in `runs/sddfb`. Image inference saves Combined, OBB-only and Segmentation-only PNG files. Video inference lets you choose one of those output modes and writes an MP4 to `runs/app`. The rendered video is square at the selected input size and does not copy the source audio track.
