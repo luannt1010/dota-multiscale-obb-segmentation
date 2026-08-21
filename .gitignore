@@ -1,0 +1,21 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# IDE configuration
+.idea/
+.vscode/
+
+# Training and inference artifacts
+runs/
+res/
+test_img/
+
+# OS metadata
+.DS_Store
+Thumbs.db
