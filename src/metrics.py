@@ -1,34 +1,6 @@
-"""Evaluation metrics for the DOTA OBB detection and segmentation tasks.
-
-The detection metric uses exact convex-polygon IoU and COCO-style 101-point
-interpolation.  It reports AP50 and AP averaged over IoU thresholds 0.50:0.05:0.95.
-Ground-truth entries marked by ``ignore``, ``difficult`` or ``iscrowd`` do not
-count as positives and detections matched to them do not count as false positives.
-
-Detection inputs are sequences with one dictionary per image::
-
-    prediction = {
-        "boxes": Tensor[N, 5],       # (cx, cy, width, height, angle_radians)
-        # or "polygons": Tensor[N, 4, 2]
-        "scores": Tensor[N],
-        "labels": Tensor[N],
-    }
-    target = {
-        "polygons": Tensor[M, 4, 2],
-        # or "boxes": Tensor[M, 5]
-        "labels": Tensor[M],
-        "difficult": Tensor[M],     # optional
-    }
-
-The segmentation metric is designed for this project's multi-label masks with
-shape ``[B, C, H, W]``. It accumulates a dataset-level confusion matrix and
-reports per-class and macro/micro IoU, Dice, precision and recall.
-"""
-
 from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
-import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -76,32 +48,153 @@ def obb_to_polygons(boxes: Any) -> np.ndarray:
     return np.stack((x, y), axis=-1).astype(np.float32, copy=False)
 
 
+def _cross_2d(vector_a: np.ndarray, vector_b: np.ndarray) -> float:
+    return float(vector_a[0] * vector_b[1] - vector_a[1] * vector_b[0])
+
+
 def _convex_polygon(polygon: Any) -> np.ndarray:
-    points = _as_numpy(polygon, np.float32).reshape(-1, 2)
+    """Return a counter-clockwise float64 convex hull using monotonic chains."""
+    points = _as_numpy(polygon, np.float64).reshape(-1, 2)
     if len(points) < 3:
-        return np.empty((0, 2), dtype=np.float32)
-    return cv2.convexHull(points).reshape(-1, 2).astype(np.float32, copy=False)
+        return np.empty((0, 2), dtype=np.float64)
+    if not np.all(np.isfinite(points)):
+        raise ValueError("polygon coordinates must be finite")
+    points = np.unique(points, axis=0)
+    if len(points) < 3:
+        return np.empty((0, 2), dtype=np.float64)
+    points = points[np.lexsort((points[:, 1], points[:, 0]))]
+
+    def build_half(sequence: np.ndarray) -> list[np.ndarray]:
+        half: list[np.ndarray] = []
+        for point in sequence:
+            while len(half) >= 2:
+                turn = _cross_2d(half[-1] - half[-2], point - half[-1])
+                if turn > 0.0:
+                    break
+                half.pop()
+            half.append(point)
+        return half
+
+    lower = build_half(points)
+    upper = build_half(points[::-1])
+    return np.asarray(lower[:-1] + upper[:-1], dtype=np.float64)
 
 
-def polygon_iou(polygon_a: Any, polygon_b: Any, eps: float = 1e-9) -> float:
-    """Return exact IoU of two convex polygons using floating-point geometry."""
-    poly_a = _convex_polygon(polygon_a)
-    poly_b = _convex_polygon(polygon_b)
+def _polygon_area(polygon: np.ndarray) -> float:
+    if len(polygon) < 3:
+        return 0.0
+    x = polygon[:, 0]
+    y = polygon[:, 1]
+    return abs(float(0.5 * np.sum(x * np.roll(y, -1) - y * np.roll(x, -1))))
+
+
+def _line_intersection(
+    segment_start: np.ndarray,
+    segment_end: np.ndarray,
+    edge_start: np.ndarray,
+    edge_end: np.ndarray,
+    eps: float,
+) -> np.ndarray:
+    segment = segment_end - segment_start
+    edge = edge_end - edge_start
+    denominator = _cross_2d(segment, edge)
+    if abs(denominator) <= eps:
+        return 0.5 * (segment_start + segment_end)
+    amount = _cross_2d(edge_start - segment_start, edge) / denominator
+    return segment_start + amount * segment
+
+
+def _clip_convex_polygon(
+    subject: np.ndarray,
+    clip: np.ndarray,
+    eps: float,
+) -> np.ndarray:
+    """Sutherland-Hodgman clipping for counter-clockwise convex polygons."""
+    output = [point.copy() for point in subject]
+    for edge_index, edge_start in enumerate(clip):
+        edge_end = clip[(edge_index + 1) % len(clip)]
+        incoming = output
+        output = []
+        if not incoming:
+            break
+
+        edge = edge_end - edge_start
+
+        def inside(point: np.ndarray) -> bool:
+            return _cross_2d(edge, point - edge_start) >= -eps
+
+        previous = incoming[-1]
+        previous_inside = inside(previous)
+        for current in incoming:
+            current_inside = inside(current)
+            if current_inside:
+                if not previous_inside:
+                    output.append(
+                        _line_intersection(
+                            previous,
+                            current,
+                            edge_start,
+                            edge_end,
+                            eps,
+                        )
+                    )
+                output.append(current.copy())
+            elif previous_inside:
+                output.append(
+                    _line_intersection(
+                        previous,
+                        current,
+                        edge_start,
+                        edge_end,
+                        eps,
+                    )
+                )
+            previous = current
+            previous_inside = current_inside
+    return np.asarray(output, dtype=np.float64).reshape(-1, 2)
+
+
+def polygon_iou(polygon_a: Any, polygon_b: Any, eps: float = 1e-12) -> float:
+    """Return stable, symmetric IoU of two convex polygons in float64."""
+    points_a = _as_numpy(polygon_a, np.float64).reshape(-1, 2)
+    points_b = _as_numpy(polygon_b, np.float64).reshape(-1, 2)
+    if len(points_a) < 3 or len(points_b) < 3:
+        return 0.0
+    if not np.all(np.isfinite(points_a)) or not np.all(np.isfinite(points_b)):
+        raise ValueError("polygon coordinates must be finite")
+
+    # Local normalisation avoids precision loss for tiny boxes at large image
+    # coordinates. IoU is invariant to this translation and uniform scaling.
+    combined = np.concatenate((points_a, points_b), axis=0)
+    origin = combined.mean(axis=0)
+    scale = max(float(np.ptp(combined, axis=0).max()), eps)
+    poly_a = _convex_polygon((points_a - origin) / scale)
+    poly_b = _convex_polygon((points_b - origin) / scale)
     if len(poly_a) < 3 or len(poly_b) < 3:
         return 0.0
 
-    area_a = abs(float(cv2.contourArea(poly_a)))
-    area_b = abs(float(cv2.contourArea(poly_b)))
+    area_a = _polygon_area(poly_a)
+    area_b = _polygon_area(poly_b)
     if area_a <= eps or area_b <= eps:
         return 0.0
 
-    intersection, _ = cv2.intersectConvexConvex(poly_a, poly_b)
-    intersection = float(np.clip(intersection, 0.0, min(area_a, area_b)))
+    intersection_ab = _polygon_area(
+        _clip_convex_polygon(poly_a, poly_b, eps)
+    )
+    intersection_ba = _polygon_area(
+        _clip_convex_polygon(poly_b, poly_a, eps)
+    )
+    intersection = float(
+        np.clip(
+            0.5 * (intersection_ab + intersection_ba),
+            0.0,
+            min(area_a, area_b),
+        )
+    )
     union = area_a + area_b - intersection
     if union <= eps:
         return 0.0
     return float(np.clip(intersection / union, 0.0, 1.0))
-
 
 def pairwise_polygon_iou(polygons_a: Any, polygons_b: Any) -> np.ndarray:
     """Compute the ``[N, M]`` IoU matrix for two polygon collections."""
