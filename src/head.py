@@ -1,7 +1,6 @@
 import math
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from src.backbone import norm2d
 
 
@@ -28,13 +27,14 @@ class OBBDetectionHead(nn.Module):
         self.angle_pred = nn.Conv2d(feat_channels,1,1)
         self.centerness_pred = nn.Conv2d(feat_channels,1,1)
         nn.init.constant_(self.cls_pred.bias, -4.6)
+        nn.init.constant_(self.centerness_pred.bias, -4.6)
 
     def forward(self, x):
         x = self.stem(x)
         cls_feat = self.cls_branch(x)
         reg_feat = self.reg_branch(x)
         cls_logits = self.cls_pred(cls_feat)
-        bbox = F.relu(self.box_pred(reg_feat))
+        bbox = self.box_pred(reg_feat)
         angle = torch.tanh(self.angle_pred(reg_feat)) * torch.pi
         centerness = torch.sigmoid(self.centerness_pred(reg_feat))
 
