@@ -18,6 +18,27 @@ def parse_args():
     parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
+    if args.epochs <= 0:
+        parser.error("--epochs must be positive")
+    if args.batch_size <= 0:
+        parser.error("--batch_size must be positive")
+    if args.lr <= 0:
+        parser.error("--lr must be positive")
+    if args.weight_decay < 0:
+        parser.error("--weight_decay cannot be negative")
+    if args.num_workers < 0:
+        parser.error("--num_workers cannot be negative")
+
+    requested_size = args.img_size
+    try:
+        args.img_size = helper_functions.round_up_image_size(requested_size)
+    except ValueError as error:
+        parser.error(str(error))
+    if args.img_size != requested_size:
+        print(
+            f"Adjusted --img_size from {requested_size} to {args.img_size} "
+            "(next multiple of 32)."
+        )
     return args
 
 
