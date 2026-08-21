@@ -18,6 +18,7 @@ from src.metrics import (
     polygon_iou as exact_polygon_iou,
 )
 from torch.utils.data import DataLoader
+
 from tqdm import tqdm
 from src.dota_dataset import DotaDataset
 from src.loss_fn import detection_loss, segmentation_loss
@@ -28,13 +29,19 @@ from src.neck import SDDFBNeck
 from src.fpn_network import SimpleFPN
 
 def set_seed(seed):
-    if seed < 0:
-        raise ValueError("seed must be non-negative")
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def round_up_image_size(image_size, multiple=32):
+    if image_size <= 0:
+        raise ValueError("image_size must be positive")
+    if multiple <= 0:
+        raise ValueError("multiple must be positive")
+    return ((int(image_size) + multiple - 1) // multiple) * multiple
 
 
 def parse_dota_label(label_path, class_to_id):
@@ -48,6 +55,7 @@ def parse_dota_label(label_path, class_to_id):
                 coords = [float(v) for v in parts[:8]]
             except ValueError:
                 continue
+
             class_name = parts[8]
             if class_name not in class_to_id:
                 continue
@@ -105,15 +113,22 @@ def resize_image_and_objects(image, objects, target_size):
         raise ValueError("target_size must be positive")
 
     src_w, src_h = image.size
-    image = image.convert("RGB").resize((target_size, target_size), Image.Resampling.BILINEAR)
-    scale_x = target_size / src_w
-    scale_y = target_size / src_h
+    scale = min(target_size / src_w, target_size / src_h)
+    resized_w = min(target_size, max(1, round(src_w * scale)))
+    resized_h = min(target_size, max(1, round(src_h * scale)))
+    offset_x = (target_size - resized_w) // 2
+    offset_y = (target_size - resized_h) // 2
+
+    resized = image.convert("RGB").resize((resized_w, resized_h), Image.Resampling.BILINEAR)
+    image = Image.new("RGB", (target_size, target_size), (114, 114, 114))
+    image.paste(resized, (offset_x, offset_y))
 
     scaled_objects = []
     for obj in objects:
         polygon = np.asarray(obj["polygon"], dtype=np.float32).copy()
-        polygon[:, 0] *= scale_x
-        polygon[:, 1] *= scale_y
+        polygon *= scale
+        polygon[:, 0] += offset_x
+        polygon[:, 1] += offset_y
         scaled_objects.append({**obj, "polygon": polygon})
     return image, scaled_objects
 
@@ -168,11 +183,8 @@ def apply_train_augmentation(image, objects, hflip_prob=0.5,  vflip_prob=0.25, r
 def draw_gaussian(heatmap, cls_id, cx, cy, radius=2):
     _, out_h, out_w = heatmap.shape
     diameter = 2 * radius + 1
-    yy, xx = torch.meshgrid(
-        torch.arange(diameter, dtype=torch.float32),
-        torch.arange(diameter, dtype=torch.float32),
-        indexing="ij",
-    )
+    yy, xx = torch.meshgrid(torch.arange(diameter, dtype=torch.float32),
+                            torch.arange(diameter, dtype=torch.float32), indexing="ij")
     center = radius
     sigma = radius / 2 + 1e-6
     gaussian = torch.exp(-((xx - center) ** 2 + (yy - center) ** 2) / (2 * sigma ** 2))
@@ -187,6 +199,14 @@ def draw_gaussian(heatmap, cls_id, cx, cy, radius=2):
     heatmap[cls_id, cy - top:cy + bottom + 1, cx - left:cx + right + 1] = torch.maximum(patch, gpatch)
 
 
+def polygon_feature_mask(polygon, out_size, stride):
+    mask_image = Image.new("L", (out_size, out_size), 0)
+    draw = ImageDraw.Draw(mask_image)
+    points = (np.asarray(polygon, dtype=np.float64) / stride).tolist()
+    draw.polygon([tuple(point) for point in points], outline=1, fill=1)
+    return torch.from_numpy(np.array(mask_image, dtype=np.uint8, copy=True)).bool()
+
+
 def make_segmentation_target(objects, image_size, stride, num_classes):
     out_size = image_size // stride
     masks = torch.zeros(num_classes, out_size, out_size, dtype=torch.float32)
@@ -194,17 +214,55 @@ def make_segmentation_target(objects, image_size, stride, num_classes):
         if obj["difficult"] != 0:
             continue
         cls_id = obj["class_id"]
-        polygon = (obj["polygon"] / stride).tolist()
-        mask_image = Image.new("L", (out_size, out_size), 0)
-        draw = ImageDraw.Draw(mask_image)
-        draw.polygon([tuple(point) for point in polygon], outline=1, fill=1)
-        mask = torch.from_numpy(np.asarray(mask_image, dtype=np.float32))
-        masks[cls_id] = torch.maximum(masks[cls_id], mask)
+        mask = polygon_feature_mask(obj["polygon"], out_size, stride)
+        masks[cls_id] = torch.maximum(masks[cls_id], mask.float())
     return masks
 
 
+def make_difficult_ignore_targets(objects, image_size, stride, num_classes):
+    """Build class-aware ignore masks for annotations marked difficult."""
+    out_size = image_size // stride
+    detection_ignore = torch.zeros(num_classes, out_size, out_size, dtype=torch.bool)
+    centerness_ignore = torch.zeros(1, out_size, out_size, dtype=torch.bool)
+    segmentation_ignore = torch.zeros_like(detection_ignore)
+    for obj in objects:
+        if obj["difficult"] == 0:
+            continue
+        cls_id = int(obj["class_id"])
+        mask = polygon_feature_mask(obj["polygon"], out_size, stride)
+        detection_ignore[cls_id] |= mask
+        segmentation_ignore[cls_id] |= mask
+        centerness_ignore[0] |= mask
+    return detection_ignore, centerness_ignore, segmentation_ignore
+
+
+def nearest_available_cell(cx, cy, stride, out_h, out_w, occupied):
+    """Return the closest unused feature cell, expanding in square rings."""
+    origin_x = min(max(int(cx / stride), 0), out_w - 1)
+    origin_y = min(max(int(cy / stride), 0), out_h - 1)
+    for radius in range(max(out_h, out_w)):
+        candidates = []
+        left = max(origin_x - radius, 0)
+        right = min(origin_x + radius, out_w - 1)
+        top = max(origin_y - radius, 0)
+        bottom = min(origin_y + radius, out_h - 1)
+        for gy in range(top, bottom + 1):
+            for gx in range(left, right + 1):
+                if max(abs(gx - origin_x), abs(gy - origin_y)) != radius:
+                    continue
+                if (gy, gx) in occupied:
+                    continue
+                cell_cx = (gx + 0.5) * stride
+                cell_cy = (gy + 0.5) * stride
+                distance = (cell_cx - cx) ** 2 + (cell_cy - cy) ** 2
+                candidates.append((distance, gy, gx))
+        if candidates:
+            _, gy, gx = min(candidates)
+            return gy, gx
+    return None
+
+
 def make_targets(objects, image_size=1024, stride=4, num_classes=15, gaussian_radius=2):
-    # Tạo target theo cell trên feature map
     out_h = image_size // stride
     out_w = image_size // stride
     heatmap = torch.zeros(num_classes, out_h, out_w, dtype=torch.float32)
@@ -213,62 +271,67 @@ def make_targets(objects, image_size=1024, stride=4, num_classes=15, gaussian_ra
     centerness = torch.zeros(1, out_h, out_w, dtype=torch.float32)
     mask = torch.zeros(1, out_h, out_w, dtype=torch.float32)
     segmentation = make_segmentation_target(objects, image_size, stride, num_classes)
+    detection_ignore, centerness_ignore, segmentation_ignore = (make_difficult_ignore_targets(objects, image_size, stride, num_classes))
 
-    for obj in objects:
+    records = []
+    for object_index, obj in enumerate(objects):
         if obj["difficult"] != 0:
             continue
-
         cx, cy, width, height, theta = polygon_to_obb(obj["polygon"])
         gx = int(cx / stride)
         gy = int(cy / stride)
         if gx < 0 or gy < 0 or gx >= out_w or gy >= out_h:
             continue
+        records.append({"object_index": object_index, "object": obj, "obb": (cx, cy, width, height, theta), "area": width * height})
+
+    # The head has one class-agnostic OBB regression slot per location. Small
+    # objects receive first choice of their centre cell; colliding objects are
+    # moved to the closest free cell and signed distances preserve exact decode.
+    records.sort(key=lambda item: (item["area"], item["object_index"]))
+    occupied = set()
+    for record in records:
+        obj = record["object"]
+        cx, cy, width, height, theta = record["obb"]
+        assigned = nearest_available_cell(cx, cy, stride, out_h, out_w, occupied)
+        if assigned is None:
+            continue
+        gy, gx = assigned
+        occupied.add((gy, gx))
 
         cls_id = obj["class_id"]
         draw_gaussian(heatmap, cls_id, gx, gy, radius=gaussian_radius)
 
         cell_cx = (gx + 0.5) * stride
         cell_cy = (gy + 0.5) * stride
-        left = max((cell_cx - (cx - width / 2)) / image_size, 0.0)
-        top = max((cell_cy - (cy - height / 2)) / image_size, 0.0)
-        right = max(((cx + width / 2) - cell_cx) / image_size, 0.0)
-        bottom = max(((cy + height / 2) - cell_cy) / image_size, 0.0)
+        left = (cell_cx - (cx - width / 2)) / image_size
+        top = (cell_cy - (cy - height / 2)) / image_size
+        right = ((cx + width / 2) - cell_cx) / image_size
+        bottom = ((cy + height / 2) - cell_cy) / image_size
 
         bbox[:, gy, gx] = torch.tensor([left, top, right, bottom], dtype=torch.float32)
         angle[:, gy, gx] = theta / math.pi
         centerness[:, gy, gx] = 1.0
         mask[:, gy, gx] = 1.0
 
-    return {
-        "heatmap": heatmap,
-        "bbox": bbox,
-        "angle": angle,
-        "centerness": centerness,
-        "mask": mask,
-        "segmentation": segmentation,
-    }
+    # Valid positives always take precedence over overlapping difficult masks.
+    centerness_ignore &= centerness < 0.5
+    segmentation_ignore &= segmentation < 0.5
+
+    return {"heatmap": heatmap, "bbox": bbox, "angle": angle, "centerness": centerness,
+            "mask": mask, "segmentation": segmentation, "detection_ignore": detection_ignore,
+            "centerness_ignore": centerness_ignore, "segmentation_ignore": segmentation_ignore}
 
 def collate_fn(batch):
     images, targets, metas = zip(*batch)
     merged_targets = {key: torch.stack([target[key] for target in targets]) for key in targets[0]}
     return torch.stack(images), merged_targets, list(metas)
 
-def create_dataloaders(
-    train_root="dataset/DOTAv1.0/train",
-    val_root="dataset/DOTAv1.0/val",
-    image_size=1024,
-    batch_size=2,
-    num_workers=2,
-):
-    train_dataset = DotaDataset(train_root, image_size=image_size, stride=config.OUTPUT_STRIDE, augment=True)
+def create_dataloaders(train_root="dataset/DOTAv1.0/train", val_root="dataset/DOTAv1.0/val", image_size=1024, batch_size=2, num_workers=2):
+    image_size = round_up_image_size(image_size)
+    train_dataset = DotaDataset(train_root, image_size=image_size, stride=config.OUTPUT_STRIDE, augment=False)
     val_dataset = DotaDataset(val_root, image_size=image_size, stride=config.OUTPUT_STRIDE, augment=False)
 
-    loader_kwargs = {
-        "num_workers": num_workers,
-        "collate_fn": collate_fn,
-        "pin_memory": torch.cuda.is_available(),
-        "persistent_workers": num_workers > 0,
-    }
+    loader_kwargs = {"num_workers": num_workers, "collate_fn": collate_fn, "pin_memory": torch.cuda.is_available(), "persistent_workers": num_workers > 0}
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, **loader_kwargs)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, **loader_kwargs)
     return train_loader, val_loader
@@ -279,7 +342,7 @@ def move_targets(targets, device):
 def train(model, train_loader, val_loader, optimizer, scheduler, sp, num_epochs):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
-    print(f"Model is training on {device}.")
+    print(f"Model is training on {device} in float32.")
     best_combined = float("-inf")
     best_map = float("-inf")
     best_miou = float("-inf")
@@ -305,13 +368,13 @@ def train(model, train_loader, val_loader, optimizer, scheduler, sp, num_epochs)
         for images, targets, _ in train_pbar:
             images = images.to(device, non_blocking=True)
             targets = move_targets(targets, device)
+            optimizer.zero_grad(set_to_none=True)
 
             outputs = model(images)
             det_loss, det_parts = detection_loss(outputs, targets)
             seg_loss = segmentation_loss(outputs, targets)
             loss = det_loss + seg_loss
-            train_running_loss += loss.item()
-            optimizer.zero_grad(set_to_none=True)
+            train_running_loss += loss.detach().item()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
@@ -319,10 +382,7 @@ def train(model, train_loader, val_loader, optimizer, scheduler, sp, num_epochs)
 
         model.eval()
         val_running_loss = 0
-        detection_metric = OBBMeanAveragePrecision(
-            num_classes=len(config.DOTA_CLASSES),
-            class_names=config.DOTA_CLASSES,
-        )
+        detection_metric = OBBMeanAveragePrecision(num_classes=len(config.DOTA_CLASSES), class_names=config.DOTA_CLASSES, max_detections=100)
         segmentation_metric = SegmentationMetrics(num_classes=len(config.DOTA_CLASSES), class_names=config.DOTA_CLASSES)
         val_pbar = tqdm(val_loader, desc=f"[Validating] Epoch {epoch+1}/{num_epochs}", leave=False)
         with torch.no_grad():
@@ -334,20 +394,12 @@ def train(model, train_loader, val_loader, optimizer, scheduler, sp, num_epochs)
                 det_loss, det_parts = detection_loss(outputs, targets)
                 seg_loss = segmentation_loss(outputs, targets)
                 loss = det_loss + seg_loss
-                val_running_loss += loss.item()
-                segmentation_metric.update(outputs, targets)
-                batch_detections = decode_batch_predictions(
-                    outputs,
-                    image_size=images.shape[-1],
-                    stride=config.OUTPUT_STRIDE,
-                    conf_threshold=0.001,
-                    topk=100,
-                    nms_iou_threshold=0.5,
-                )
-                detection_metric.update(
-                    [detections_to_metric_input(items) for items in batch_detections],
-                    [objects_to_metric_target(meta["objects"]) for meta in metas],
-                )
+                val_running_loss += loss.detach().item()
+                segmentation_metric.update(outputs, targets, ignore_mask=targets.get("segmentation_ignore"))
+                batch_detections = decode_batch_predictions(outputs, image_size=images.shape[-1], stride=config.OUTPUT_STRIDE,
+                                                            conf_threshold=0.001, topk=100, nms_iou_threshold=0.5)
+                detection_metric.update([detections_to_metric_input(items) for items in batch_detections],
+                                        [objects_to_metric_target(meta["objects"]) for meta in metas])
             val_epoch_loss = val_running_loss / len(val_loader)
         detection_results = detection_metric.compute()
         segmentation_results = segmentation_metric.compute()
@@ -360,7 +412,7 @@ def train(model, train_loader, val_loader, optimizer, scheduler, sp, num_epochs)
 
         if scheduler is not None:
             if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                scheduler.step(val_epoch_loss)
+                scheduler.step(map_50_95)
             else:
                 scheduler.step()
 
@@ -376,19 +428,8 @@ def train(model, train_loader, val_loader, optimizer, scheduler, sp, num_epochs)
         history["map_50_95"].append(map_50_95)
         history["miou"].append(miou)
         history["mean_dice"].append(mean_dice)
-        checkpoint = {
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "scheduler": scheduler.state_dict() if scheduler is not None else None,
-            "epoch": epoch,
-            "metrics": {
-                "map_50": map_50,
-                "map_50_95": map_50_95,
-                "miou": miou,
-                "mean_dice": mean_dice,
-                "combined_score": combined_score,
-            },
-        }
+        checkpoint = {"model": model.state_dict(), "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict() if scheduler is not None else None,
+                      "epoch": epoch, "metrics": {"map_50": map_50, "map_50_95": map_50_95, "miou": miou, "mean_dice": mean_dice, "combined_score": combined_score}}
         if combined_score > best_combined:
             best_combined = combined_score
             torch.save(checkpoint, best_save_path)
@@ -435,9 +476,7 @@ def polygon_mask(polygon, image_size):
     return np.asarray(mask, dtype=bool)
 
 
-def polygon_iou(poly_a, poly_b, image_size=None):
-    # image_size is retained for backward-compatible call sites.
-    _ = image_size
+def polygon_iou(poly_a, poly_b):
     return exact_polygon_iou(poly_a, poly_b)
 
 
@@ -456,7 +495,7 @@ def evaluate_detections(detections, gt_objects, image_size, iou_threshold=0.5):
         for index, obj in enumerate(gt_objects):
             if index in matched_gt or obj["class_id"] != det["class_id"] or obj["difficult"] != 0:
                 continue
-            iou = polygon_iou(pred_polygon, obj["polygon"], image_size)
+            iou = polygon_iou(pred_polygon, obj["polygon"])
             if iou > best_iou:
                 best_iou = iou
                 best_index = index
@@ -480,9 +519,6 @@ def build_gt_class_map(gt_objects, image_size):
 
 def rotated_nms(detections, iou_threshold=0.5):
     """Apply class-wise greedy NMS using exact convex-polygon IoU."""
-    if not 0.0 <= iou_threshold <= 1.0:
-        raise ValueError("iou_threshold must be in [0, 1]")
-
     kept = []
     for det in sorted(detections, key=lambda item: item["score"], reverse=True):
         polygon = obb_to_polygon(*det["obb"])
@@ -499,16 +535,7 @@ def rotated_nms(detections, iou_threshold=0.5):
     return kept
 
 
-def decode_predictions(
-    outputs,
-    image_size,
-    stride=4,
-    conf_threshold=0.15,
-    topk=50,
-    class_names=config.DOTA_CLASSES,
-    batch_index=0,
-    nms_iou_threshold=0.5,
-):
+def decode_predictions(outputs, image_size, stride=4, conf_threshold=0.15, topk=50, class_names=config.DOTA_CLASSES, batch_index=0, nms_iou_threshold=0.5):
     obb = outputs["obb"] if "obb" in outputs else outputs
     batch_size = obb["cls_logits"].shape[0]
     if not 0 <= batch_index < batch_size:
@@ -542,6 +569,12 @@ def decode_predictions(
 
         left, top, right, bottom = bbox[:, y, x].detach().cpu().numpy().tolist()
         theta = float(angle[y, x].detach().cpu())
+        raw_values = (score, left, top, right, bottom, theta)
+        if not all(math.isfinite(value) for value in raw_values):
+            raise ValueError(
+                "Model prediction contains NaN or Inf at "
+                f"batch_index={batch_index}, class_id={cls_id}, y={y}, x={x}"
+            )
         cell_cx = (x + 0.5) * stride
         cell_cy = (y + 0.5) * stride
         width = max((left + right) * image_size, 1.0)
@@ -549,26 +582,21 @@ def decode_predictions(
         cx = cell_cx + (right - left) * image_size / 2
         cy = cell_cy + (bottom - top) * image_size / 2
 
-        detections.append({
-            "score": score,
-            "class_id": cls_id,
-            "class_name": class_names[cls_id],
-            "obb": (cx, cy, width, height, theta),
-        })
+        if not all(
+            math.isfinite(value) for value in (cx, cy, width, height, theta)
+        ):
+            raise ValueError(
+                "Decoded OBB contains NaN or Inf at "
+                f"batch_index={batch_index}, class_id={cls_id}, y={y}, x={x}"
+            )
+
+        detections.append({"score": score, "class_id": cls_id, "class_name": class_names[cls_id], "obb": (cx, cy, width, height, theta)})
 
     detections = rotated_nms(detections, iou_threshold=nms_iou_threshold)
     return detections[:topk]
 
 
-def decode_batch_predictions(
-    outputs,
-    image_size,
-    stride=4,
-    conf_threshold=0.15,
-    topk=50,
-    class_names=config.DOTA_CLASSES,
-    nms_iou_threshold=0.5,
-):
+def decode_batch_predictions( outputs, image_size, stride=4, conf_threshold=0.15, topk=50, class_names=config.DOTA_CLASSES, nms_iou_threshold=0.5):
     obb = outputs["obb"] if "obb" in outputs else outputs
     batch_size = obb["cls_logits"].shape[0]
     return [
@@ -643,6 +671,7 @@ def draw_segment_image(image, outputs, image_size, gt_objects=None, threshold=0.
 def inference(model,image_path, label_path=None, image_size=1024, conf_threshold=0.15,
               seg_threshold=0.5, obb_iou_threshold=0.5, nms_iou_threshold=0.5, topk=50, device=None, obb_output_path=None, segment_output_path=None):
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    image_size = round_up_image_size(image_size)
     model = model.to(device)
     model.eval()
 
